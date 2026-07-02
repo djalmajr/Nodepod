@@ -37,6 +37,64 @@ const instancePorts = new Map();
 // clientId -> { instanceId, serverPort } for preview iframes
 const previewClients = new Map();
 
+// The browser terminates idle service workers and this in-memory map dies
+// with them, which strands already-open preview iframes (their relative
+// fetches stop routing to the pod). Entries are mirrored into the Cache API
+// so a freshly restarted worker can lazily restore them on first miss.
+const SW_STATE_CACHE = "nodepod-sw-state-v1";
+const PREVIEW_CLIENT_KEY_PREFIX = "https://nodepod.sw/preview-client/";
+
+// clientIds already checked against the persisted state with no hit, so
+// ordinary page clients only pay the cache lookup once.
+const restoreMisses = new Set();
+
+function persistPreviewClient(clientId, pod) {
+  if (!clientId) return;
+  caches
+    .open(SW_STATE_CACHE)
+    .then((cache) =>
+      cache.put(
+        new Request(PREVIEW_CLIENT_KEY_PREFIX + encodeURIComponent(clientId)),
+        new Response(JSON.stringify(pod)),
+      ),
+    )
+    .catch(() => {});
+}
+
+function forgetPreviewClient(clientId) {
+  if (!clientId) return;
+  caches
+    .open(SW_STATE_CACHE)
+    .then((cache) =>
+      cache.delete(new Request(PREVIEW_CLIENT_KEY_PREFIX + encodeURIComponent(clientId))),
+    )
+    .catch(() => {});
+}
+
+async function restorePreviewClient(clientId) {
+  try {
+    const cache = await caches.open(SW_STATE_CACHE);
+    const stored = await cache.match(
+      new Request(PREVIEW_CLIENT_KEY_PREFIX + encodeURIComponent(clientId)),
+    );
+    if (!stored) return null;
+    const pod = await stored.json();
+    if (pod && pod.instanceId && typeof pod.serverPort === "number") {
+      previewClients.set(clientId, pod);
+      return pod;
+    }
+  } catch {
+    // fall through to null
+  }
+  return null;
+}
+
+function trackPreviewClient(clientId, pod) {
+  previewClients.set(clientId, pod);
+  restoreMisses.delete(clientId);
+  persistPreviewClient(clientId, pod);
+}
+
 // stripped path -> pod. iframes claim their path so a reload that lands on
 // the stripped url (no prefix, new clientId) can still be routed. bounded.
 const pathToPodMap = new Map();
@@ -296,7 +354,7 @@ self.addEventListener("message", (event) => {
   if (!isValidToken(data.token)) return;
 
   if (data.type === "register-preview") {
-    previewClients.set(data.clientId, {
+    trackPreviewClient(data.clientId, {
       instanceId: data.instanceId || DEFAULT_INSTANCE,
       serverPort: data.serverPort,
     });
@@ -304,6 +362,7 @@ self.addEventListener("message", (event) => {
   }
   if (data.type === "unregister-preview") {
     previewClients.delete(data.clientId);
+    forgetPreviewClient(data.clientId);
     return;
   }
   if (data.type === "set-preview-script") {
@@ -385,7 +444,7 @@ self.addEventListener("fetch", (event) => {
       event.respondWith(
         (async () => {
           if (event.resultingClientId) {
-            previewClients.set(event.resultingClientId, { instanceId, serverPort });
+            trackPreviewClient(event.resultingClientId, { instanceId, serverPort });
           }
           return proxyToVirtualServer(event.request, instanceId, serverPort, path);
         })(),
@@ -408,7 +467,7 @@ self.addEventListener("fetch", (event) => {
       event.respondWith(
         (async () => {
           if (event.resultingClientId) {
-            previewClients.set(event.resultingClientId, { instanceId, serverPort });
+            trackPreviewClient(event.resultingClientId, { instanceId, serverPort });
           }
           return proxyToVirtualServer(event.request, instanceId, serverPort, path);
         })(),
@@ -441,6 +500,39 @@ self.addEventListener("fetch", (event) => {
     }
   }
 
+  // 3b. clientId is unknown to this (possibly freshly restarted) worker:
+  //     try the persisted preview-client state before giving up. Skipped for
+  //     navigations so the referer/path-claim fallbacks below keep handling
+  //     those. Ordinary page clients miss once and are then remembered.
+  if (
+    clientId &&
+    !restoreMisses.has(clientId) &&
+    event.request.mode !== "navigate"
+  ) {
+    const host = url.hostname;
+    if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === self.location.hostname) {
+      event.respondWith(
+        (async () => {
+          const pod = await restorePreviewClient(clientId);
+          if (pod) {
+            let path = stripPreviewPrefix(url.pathname);
+            path += url.search;
+            return proxyToVirtualServer(
+              event.request,
+              pod.instanceId,
+              pod.serverPort,
+              path,
+              event.request,
+            );
+          }
+          restoreMisses.add(clientId);
+          return fetch(event.request);
+        })(),
+      );
+      return;
+    }
+  }
+
   // 4. fallback: check Referer header. Handles the Firefox race where the first
   //    subresource after a navigation arrives with event.clientId === "".
   const referer = event.request.referrer;
@@ -463,7 +555,7 @@ self.addEventListener("fetch", (event) => {
           let path = stripPreviewPrefix(url.pathname);
           path += url.search;
           if (clientId) {
-            previewClients.set(clientId, { instanceId, serverPort });
+            trackPreviewClient(clientId, { instanceId, serverPort });
           }
           event.respondWith(
             proxyToVirtualServer(event.request, instanceId, serverPort, path, event.request),
@@ -491,7 +583,7 @@ self.addEventListener("fetch", (event) => {
         const { instanceId, serverPort } = pathHit;
         const path = url.pathname + url.search;
         if (event.resultingClientId) {
-          previewClients.set(event.resultingClientId, { instanceId, serverPort });
+          trackPreviewClient(event.resultingClientId, { instanceId, serverPort });
         }
         event.respondWith(
           proxyToVirtualServer(event.request, instanceId, serverPort, path, event.request),
