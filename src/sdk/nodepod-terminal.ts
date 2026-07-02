@@ -79,6 +79,7 @@ export class NodepodTerminal {
   private _lastNotifiedRows = -1;
 
   private _lineBuffer = "";
+  private _cursor = 0;
   private _history: string[] = [];
   private _historyIndex = -1;
   private _savedLine = "";
@@ -262,9 +263,8 @@ export class NodepodTerminal {
 
   input(text: string): void {
     if (!this._term) return;
-    for (const ch of text) {
-      this._handleInput(ch);
-    }
+    // Passed whole so multi-byte escape sequences survive parsing.
+    this._handleInput(text);
   }
 
   setTheme(theme: Partial<TerminalTheme>): void {
@@ -371,34 +371,75 @@ export class NodepodTerminal {
 
       if (ch === "\r" || ch === "\n") {
         const cmd = this._lineBuffer;
+        this._moveCursorTo(this._lineBuffer.length);
         this._lineBuffer = "";
+        this._cursor = 0;
         this._historyIndex = -1;
         this._executeCommand(cmd);
       } else if (code === 127 || code === 8) {
-        if (this._lineBuffer.length > 0) {
-          this._lineBuffer = this._lineBuffer.slice(0, -1);
-          this._term.write("\b \b");
+        if (this._cursor > 0) {
+          const rest = this._lineBuffer.slice(this._cursor);
+          this._lineBuffer = this._lineBuffer.slice(0, this._cursor - 1) + rest;
+          this._cursor--;
+          this._term.write("\b" + rest + " " + "\b".repeat(rest.length + 1));
         }
       } else if (code === 3) {
+        this._moveCursorTo(this._lineBuffer.length);
         this._lineBuffer = "";
+        this._cursor = 0;
         this._term.write("^C");
         this._writePrompt();
       } else if (code === 12) {
         this._term.clear();
         this._term.write(this._promptFn(this._cwd) + this._lineBuffer);
-      } else if (ch === "\x1b" && i + 2 < data.length && data[i + 1] === "[") {
-        const arrow = data[i + 2];
-        i += 2;
-        if (arrow === "A") this._historyUp();
-        else if (arrow === "B") this._historyDown();
+        this._term.write("\b".repeat(this._lineBuffer.length - this._cursor));
+      } else if (code === 1) {
+        this._moveCursorTo(0);
+      } else if (code === 5) {
+        this._moveCursorTo(this._lineBuffer.length);
+      } else if (ch === "\x1b" && (data[i + 1] === "[" || data[i + 1] === "O")) {
+        // CSI/SS3 sequence: consume through the final byte
+        let end = i + 2;
+        while (end < data.length && !/[A-Za-z~]/.test(data[end])) end++;
+        const seq = data.slice(i + 2, end + 1);
+        i = end;
+        if (seq === "A") this._historyUp();
+        else if (seq === "B") this._historyDown();
+        else if (seq === "C") this._moveCursorTo(this._cursor + 1);
+        else if (seq === "D") this._moveCursorTo(this._cursor - 1);
+        else if (seq === "H" || seq === "1~") this._moveCursorTo(0);
+        else if (seq === "F" || seq === "4~") this._moveCursorTo(this._lineBuffer.length);
+        else if (seq === "3~") this._deleteAtCursor();
       } else if (code === 9) {
         this._handleTab();
       } else if (code >= 32) {
-        this._lineBuffer += ch;
-        this._term.write(ch);
+        const rest = this._lineBuffer.slice(this._cursor);
+        this._lineBuffer = this._lineBuffer.slice(0, this._cursor) + ch + rest;
+        this._cursor++;
+        this._term.write(ch + rest + "\b".repeat(rest.length));
         this._tabCount = 0;
       }
     }
+  }
+
+  /* ---- Cursor movement (prompt mode) ---- */
+
+  private _moveCursorTo(pos: number): void {
+    const target = Math.max(0, Math.min(this._lineBuffer.length, pos));
+    const delta = target - this._cursor;
+    if (delta > 0) {
+      this._term.write("\x1b[C".repeat(delta));
+    } else if (delta < 0) {
+      this._term.write("\x1b[D".repeat(-delta));
+    }
+    this._cursor = target;
+  }
+
+  private _deleteAtCursor(): void {
+    if (this._cursor >= this._lineBuffer.length) return;
+    const rest = this._lineBuffer.slice(this._cursor + 1);
+    this._lineBuffer = this._lineBuffer.slice(0, this._cursor) + rest;
+    this._term.write(rest + " " + "\b".repeat(rest.length + 1));
   }
 
   /* ---- History navigation ---- */
@@ -433,6 +474,7 @@ export class NodepodTerminal {
       "\r" + prompt + " ".repeat(this._lineBuffer.length) + "\r" + prompt,
     );
     this._lineBuffer = text;
+    this._cursor = text.length;
     this._term.write(text);
   }
 
@@ -447,7 +489,8 @@ export class NodepodTerminal {
     const provider = this._wiring?.getCompletions;
     if (!provider) return;
 
-    // cursor is always at the end — no mid-line editing yet
+    // completion still assumes an end-of-line cursor, so move there first
+    this._moveCursorTo(this._lineBuffer.length);
     const cursorPos = this._lineBuffer.length;
     let result;
     try {
@@ -503,6 +546,7 @@ export class NodepodTerminal {
     }
     this._term.write(replacement);
     this._lineBuffer = newBuffer;
+    this._cursor = newBuffer.length;
   }
 
   private _printMatches(matches: string[]): void {
