@@ -288,6 +288,47 @@ function inferMimeType(path, responseHeaders) {
   return null; // no override
 }
 
+const POD_ISOLATION_HEADERS = {
+  "Cross-Origin-Resource-Policy": "cross-origin",
+  "Cross-Origin-Embedder-Policy": "credentialless",
+  "Cross-Origin-Opener-Policy": "same-origin",
+};
+
+function hasHeader(headers, name) {
+  const needle = name.toLowerCase();
+  if (typeof headers.has === "function") {
+    return headers.has(name);
+  }
+  return Object.keys(headers).some((key) => key.toLowerCase() === needle);
+}
+
+function setHeader(headers, name, value) {
+  if (typeof headers.set === "function") {
+    headers.set(name, value);
+  } else {
+    headers[name] = value;
+  }
+}
+
+function addPodIsolationHeaders(headers) {
+  for (const [name, value] of Object.entries(POD_ISOLATION_HEADERS)) {
+    if (!hasHeader(headers, name)) {
+      setHeader(headers, name, value);
+    }
+  }
+  return headers;
+}
+
+function withPodIsolationHeaders(response) {
+  const headers = new Headers(response.headers);
+  addPodIsolationHeaders(headers);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 // ── Lifecycle ──
 
 self.addEventListener("install", () => {
@@ -940,12 +981,12 @@ function errorPage(status, title, message) {
   return new Response(html, {
     status,
     statusText: title,
-    headers: {
+    headers: addPodIsolationHeaders({
       "content-type": "text/html; charset=utf-8",
       "Cross-Origin-Resource-Policy": "cross-origin",
       "Cross-Origin-Embedder-Policy": "credentialless",
       "Cross-Origin-Opener-Policy": "same-origin",
-    },
+    }),
   });
 }
 
@@ -1087,20 +1128,7 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
       }
     }
 
-    // Ensure COEP compatibility: the parent page sets
-    // Cross-Origin-Embedder-Policy: credentialless, so all sub-resources
-    // (including iframe content served by this SW) need CORP headers.
-    // Additionally, iframe HTML documents need their own COEP/COOP headers
-    // so that subresources loaded by the iframe are also allowed.
-    if (!respHeaders["cross-origin-resource-policy"] && !respHeaders["Cross-Origin-Resource-Policy"]) {
-      respHeaders["Cross-Origin-Resource-Policy"] = "cross-origin";
-    }
-    if (!respHeaders["cross-origin-embedder-policy"] && !respHeaders["Cross-Origin-Embedder-Policy"]) {
-      respHeaders["Cross-Origin-Embedder-Policy"] = "credentialless";
-    }
-    if (!respHeaders["cross-origin-opener-policy"] && !respHeaders["Cross-Origin-Opener-Policy"]) {
-      respHeaders["Cross-Origin-Opener-Policy"] = "same-origin";
-    }
+    addPodIsolationHeaders(respHeaders);
 
     // If the virtual server returned 404 and we have the original request,
     // fall back to a real network fetch. This handles cases where the preview
@@ -1108,7 +1136,8 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     // that the virtual server doesn't serve.
     if ((data.statusCode === 404) && fallbackRequest) {
       try {
-        return await fetch(fallbackRequest);
+        const fallbackResponse = await fetch(fallbackRequest);
+        return withPodIsolationHeaders(fallbackResponse);
       } catch (fetchErr) {
         // Fall through to return the original 404
       }
