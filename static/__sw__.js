@@ -563,16 +563,22 @@ self.addEventListener("fetch", (event) => {
   // 3. request from a tracked preview client, route through that instance's
   //    virtual server. catches module imports like /@react-refresh etc.
   //    only same-origin, let cross-origin (google fonts, CDNs) pass through
+  //    form navigations that replace an iframe expose the old document as
+  //    replacesClientId, not clientId.
   const clientId = event.clientId;
-  if (clientId && previewClients.has(clientId)) {
+  const routingClientId = clientId || event.replacesClientId;
+  if (routingClientId && previewClients.has(routingClientId)) {
     const host = url.hostname;
     if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === self.location.hostname) {
-      const { instanceId, serverPort } = previewClients.get(clientId);
+      const { instanceId, serverPort } = previewClients.get(routingClientId);
       // strip /__preview__/{instanceId}/{port} or /__virtual__/{instanceId}/{port}
       // (or legacy forms) if the browser resolved a relative URL against the
       // preview page's location.
       let path = stripPreviewPrefix(url.pathname);
       path += url.search;
+      if (event.resultingClientId && event.resultingClientId !== routingClientId) {
+        trackPreviewClient(event.resultingClientId, { instanceId, serverPort });
+      }
       event.respondWith(
         proxyToVirtualServer(event.request, instanceId, serverPort, path, event.request),
       );
