@@ -329,6 +329,45 @@ function withPodIsolationHeaders(response) {
   });
 }
 
+function isRedirectStatus(status) {
+  return status >= 300 && status < 400;
+}
+
+function getHeaderValue(headers, name) {
+  const needle = name.toLowerCase();
+  if (typeof headers.get === "function") {
+    return headers.get(name);
+  }
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === needle) return headers[key];
+  }
+  return null;
+}
+
+function makeNavigationRedirectTarget(location, request) {
+  let redirectUrl;
+  try {
+    redirectUrl = new URL(location, request.url);
+  } catch {
+    return null;
+  }
+
+  const headers = new Headers(request.headers);
+  headers.delete("content-length");
+  headers.delete("content-type");
+
+  return {
+    path: stripPreviewPrefix(redirectUrl.pathname) + redirectUrl.search,
+    request: {
+      arrayBuffer: async () => new ArrayBuffer(0),
+      headers,
+      method: "GET",
+      mode: request.mode,
+      url: redirectUrl.toString(),
+    },
+  };
+}
+
 // ── Lifecycle ──
 
 self.addEventListener("install", () => {
@@ -992,7 +1031,7 @@ function errorPage(status, title, message) {
 
 // ── Virtual server proxy ──
 
-async function proxyToVirtualServer(request, instanceId, serverPort, path, originalRequest) {
+async function proxyToVirtualServer(request, instanceId, serverPort, path, originalRequest, redirectDepth = 0) {
   // route to whichever tab owns this instanceId
   let targetPort = getPortForInstance(instanceId);
 
@@ -1080,6 +1119,29 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
       responseBody = bytes;
     }
     const respHeaders = Object.assign({}, data.headers || {});
+    const statusCode = data.statusCode || 200;
+
+    if (request.mode === "navigate" && isRedirectStatus(statusCode)) {
+      const location = getHeaderValue(respHeaders, "Location");
+      if (!location) {
+        return errorPage(502, "Bad Gateway", "Pod redirect response was missing a Location header.");
+      }
+      if (redirectDepth >= 10) {
+        return errorPage(508, "Loop Detected", "Pod navigation redirected too many times.");
+      }
+      const redirectTarget = makeNavigationRedirectTarget(location, request);
+      if (!redirectTarget) {
+        return errorPage(502, "Bad Gateway", "Pod redirect response had an invalid Location header.");
+      }
+      return proxyToVirtualServer(
+        redirectTarget.request,
+        instanceId,
+        serverPort,
+        redirectTarget.path,
+        null,
+        redirectDepth + 1,
+      );
+    }
 
     // Fix MIME type: SPA fallback middleware may serve index.html (text/html)
     // for non-HTML paths. Correct the Content-Type based on file extension.
@@ -1144,7 +1206,7 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     }
 
     return new Response(finalBody, {
-      status: data.statusCode || 200,
+      status: statusCode,
       statusText: data.statusMessage || "OK",
       headers: respHeaders,
     });
