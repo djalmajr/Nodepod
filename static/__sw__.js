@@ -365,16 +365,6 @@ function addPodIsolationHeaders(headers) {
   return headers;
 }
 
-function withPodIsolationHeaders(response) {
-  const headers = new Headers(response.headers);
-  addPodIsolationHeaders(headers);
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
-}
-
 function isRedirectStatus(status) {
   return status >= 300 && status < 400;
 }
