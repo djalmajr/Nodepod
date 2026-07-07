@@ -147,12 +147,35 @@ function claimInstance(mp, instanceId) {
   ports.get(mp).instances.add(instanceId);
 }
 
+// Drop every routing reference to an instance that is being released: the
+// preview-client map (in-memory + persisted cache) and the path-claim map.
+// releaseInstance/cleanupPort already forget instancePorts/scripts/tokens but
+// left these two dangling, so a torn-down pod's routes survived teardown. On
+// project reopen a boot-time fetch could then route at the dead instance and
+// wedge the preview (surfaced as "exited 137"). Clearing them here — instead of
+// lazily on the next fetch miss — keeps the persisted state from accumulating
+// stale dead-pod routes across sessions.
+function forgetInstanceRoutes(instanceId) {
+  for (const [clientId, pod] of previewClients) {
+    if (pod && pod.instanceId === instanceId) {
+      previewClients.delete(clientId);
+      forgetPreviewClient(clientId);
+    }
+  }
+  for (const [path, pod] of pathToPodMap) {
+    if (pod && pod.instanceId === instanceId) {
+      pathToPodMap.delete(path);
+    }
+  }
+}
+
 // only release if this port still owns it. a newer tab may have reclaimed it
 function releaseInstance(mp, instanceId) {
   if (instancePorts.get(instanceId) === mp) {
     instancePorts.delete(instanceId);
     previewScripts.delete(instanceId);
     wsTokens.delete(instanceId);
+    forgetInstanceRoutes(instanceId);
   }
   const info = ports.get(mp);
   if (info) info.instances.delete(instanceId);
@@ -167,6 +190,7 @@ function cleanupPort(mp) {
         instancePorts.delete(id);
         previewScripts.delete(id);
         wsTokens.delete(id);
+        forgetInstanceRoutes(id);
       }
     }
   }

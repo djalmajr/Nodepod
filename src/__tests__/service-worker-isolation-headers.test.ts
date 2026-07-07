@@ -15,6 +15,7 @@ type ServiceWorkerListener = (event: {
 }) => void;
 
 interface ServiceWorkerSandbox extends Record<string, unknown> {
+  __cacheDeletes?: string[];
   __fellThrough?: string[];
   __listeners?: Record<string, ServiceWorkerListener[]>;
   addPodIsolationHeaders?: (
@@ -34,11 +35,13 @@ interface ServiceWorkerSandbox extends Record<string, unknown> {
 async function loadServiceWorkerSandbox(): Promise<ServiceWorkerSandbox> {
   const listeners: Record<string, ServiceWorkerListener[]> = {};
   const fellThrough: string[] = [];
+  const cacheDeletes: string[] = [];
   const source = await readFile(
     resolve(process.cwd(), "static/__sw__.js"),
     "utf8",
   );
   const sandbox: ServiceWorkerSandbox = {
+    __cacheDeletes: cacheDeletes,
     __fellThrough: fellThrough,
     __listeners: listeners,
     Headers,
@@ -58,7 +61,14 @@ async function loadServiceWorkerSandbox(): Promise<ServiceWorkerSandbox> {
     caches: {
       open: () =>
         Promise.resolve({
-          delete: () => Promise.resolve(true),
+          // Record which persisted keys the SW deletes so tests can assert the
+          // proactive release-time cleanup ran, not just the lazy fetch path.
+          delete: (request: { url?: string } | string) => {
+            cacheDeletes.push(
+              typeof request === "string" ? request : (request.url ?? ""),
+            );
+            return Promise.resolve(true);
+          },
           match: () => Promise.resolve(undefined),
           put: () => Promise.resolve(undefined),
         }),
@@ -445,6 +455,75 @@ describe("service worker isolation headers", () => {
     const response = await responsePromise;
 
     // It must fall through to the network, not proxy to the dead pod.
+    expect(sandbox.__fellThrough).toContain("http://localhost:5173/style.css");
+    expect(await response.text()).toBe("network");
+  });
+
+  // Mutation captured: without proactive teardown cleanup, releasing an instance
+  // leaves its preview-client routes in the in-memory map and the persisted
+  // cache. A reopened project then inherits the stale dead-pod route and wedges
+  // (surfaced as "exited 137"). Release must forget the instance's routes eagerly.
+  it("forgets a released instance's preview-client routes at teardown", async () => {
+    const sandbox = await loadServiceWorkerSandbox();
+    const messageHandler = sandbox.__listeners?.message?.[0];
+    const fetchHandler = sandbox.__listeners?.fetch?.[0];
+    if (!messageHandler) throw new Error("message handler was not loaded");
+    if (!fetchHandler) throw new Error("fetch handler was not loaded");
+
+    // A live pod: the tab claims the instance and registers a preview client, so
+    // it sits in instancePorts (the lazy self-heal would keep routing to it).
+    const port: {
+      onmessage: ((event: { data: unknown }) => void) | null;
+      postMessage: () => void;
+    } = { onmessage: null, postMessage: () => {} };
+    messageHandler({
+      data: { port, token: "token", type: "init" },
+      waitUntil: () => {},
+    });
+    port.onmessage?.({
+      data: { data: { instanceId: "pod" }, type: "claim-instance" },
+    });
+    messageHandler({
+      data: {
+        clientId: "live-client",
+        instanceId: "pod",
+        serverPort: 5173,
+        token: "token",
+        type: "register-preview",
+      },
+    });
+
+    // The tab tears the pod down: teardown() -> detach() -> release-instance.
+    port.onmessage?.({
+      data: { data: { instanceId: "pod" }, type: "release-instance" },
+    });
+    // The persisted forget is a cache microtask; let it settle.
+    await new Promise((resolveTick) => setTimeout(resolveTick, 0));
+
+    // The persisted preview-client entry must be dropped eagerly at release,
+    // not left for a later fetch to lazily reap.
+    expect(sandbox.__cacheDeletes).toContain(
+      "https://nodepod.sw/preview-client/live-client",
+    );
+
+    // And a fetch on the released client now falls through instead of proxying.
+    let responsePromise: Promise<Response> | undefined;
+    fetchHandler({
+      clientId: "live-client",
+      request: {
+        headers: new Headers(),
+        method: "GET",
+        mode: "no-cors",
+        referrer: "",
+        url: "http://localhost:5173/style.css",
+      } as unknown as Request,
+      respondWith: (response) => {
+        responsePromise = Promise.resolve(response);
+      },
+    });
+    if (!responsePromise) throw new Error("fetch listener did not call respondWith");
+    const response = await responsePromise;
+
     expect(sandbox.__fellThrough).toContain("http://localhost:5173/style.css");
     expect(await response.text()).toBe("network");
   });
