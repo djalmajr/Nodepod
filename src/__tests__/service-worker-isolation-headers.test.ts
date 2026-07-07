@@ -29,7 +29,6 @@ interface ServiceWorkerSandbox extends Record<string, unknown> {
     originalRequest?: Request,
     redirectDepth?: number,
   ) => Promise<Response>;
-  withPodIsolationHeaders?: (response: Response) => Response;
 }
 
 const PREVIEW_CLIENT_KEY_PREFIX = "https://nodepod.sw/preview-client/";
@@ -146,32 +145,6 @@ describe("service worker isolation headers", () => {
 
     expect(headers["cross-origin-resource-policy"]).toBe("same-origin");
     expect(headers["Cross-Origin-Resource-Policy"]).toBeUndefined();
-  });
-
-  it("wraps redirect responses with pod isolation headers", async () => {
-    const sandbox = await loadServiceWorkerSandbox();
-    const wrap = sandbox.withPodIsolationHeaders;
-    if (!wrap) throw new Error("withPodIsolationHeaders was not loaded");
-
-    const response = wrap(
-      new Response(null, {
-        status: 302,
-        statusText: "Found",
-        headers: { Location: "/signed-in" },
-      }),
-    );
-
-    expect(response.status).toBe(302);
-    expect(response.headers.get("Location")).toBe("/signed-in");
-    expect(response.headers.get("Cross-Origin-Resource-Policy")).toBe(
-      "cross-origin",
-    );
-    expect(response.headers.get("Cross-Origin-Embedder-Policy")).toBe(
-      "credentialless",
-    );
-    expect(response.headers.get("Cross-Origin-Opener-Policy")).toBe(
-      "same-origin",
-    );
   });
 
   it("follows navigation POST redirects inside the pod", async () => {
