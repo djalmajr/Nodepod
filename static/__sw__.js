@@ -991,8 +991,11 @@ const LOCATION_PATCH_SCRIPT = `<script>
   };
   window.addEventListener('popstate', claimPath);
 
-  // plain <a href="/..."> clicks would full-navigate and lose our clientId.
-  // turn them into pushState. bubble phase so framework Link handlers win.
+  // plain <a href="/..."> clicks resolve against the origin and drop the virtual
+  // prefix, so the SW can't route them to the pod. Re-add the prefix and let the
+  // browser navigate for real — SSR / multi-page apps need the server round-trip.
+  // Bubble phase so framework Link handlers (which preventDefault for their own
+  // client-side routing) win and keep their SPA navigation.
   document.addEventListener('click', function(ev) {
     if (ev.defaultPrevented || ev.button !== 0) return;
     if (ev.metaKey || ev.ctrlKey || ev.altKey || ev.shiftKey) return;
@@ -1003,11 +1006,10 @@ const LOCATION_PATCH_SCRIPT = `<script>
     if (el.hasAttribute('download')) return;
     var raw = el.getAttribute('href');
     if (!raw || raw.charAt(0) !== '/' || raw.charAt(1) === '/') return;
-    ev.preventDefault();
-    var target = strip(raw);
-    if (target !== location.pathname + location.search + location.hash) {
-      history.pushState({}, '', target);
-      dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+    var stripped = strip(raw);
+    if (stripped !== location.pathname + location.search + location.hash) {
+      ev.preventDefault();
+      location.assign(PREFIX + stripped);
     }
   });
 
