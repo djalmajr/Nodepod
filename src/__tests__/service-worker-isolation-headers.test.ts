@@ -32,10 +32,26 @@ interface ServiceWorkerSandbox extends Record<string, unknown> {
   withPodIsolationHeaders?: (response: Response) => Response;
 }
 
-async function loadServiceWorkerSandbox(): Promise<ServiceWorkerSandbox> {
+const PREVIEW_CLIENT_KEY_PREFIX = "https://nodepod.sw/preview-client/";
+
+async function loadServiceWorkerSandbox(
+  // Seeds the persisted SW-state cache (clientId -> pod). Simulates entries that
+  // outlived an idle-recycled worker, so the in-memory maps start empty but the
+  // Cache API mirror still holds routes. Keyed by clientId.
+  persisted: Record<string, { instanceId: string; serverPort: number }> = {},
+): Promise<ServiceWorkerSandbox> {
   const listeners: Record<string, ServiceWorkerListener[]> = {};
   const fellThrough: string[] = [];
   const cacheDeletes: string[] = [];
+  // Back the Cache API stub with a real Map so keys()/match()/delete() are
+  // coherent for the persisted-sweep path. put() stays a no-op so tests that
+  // rely on match() missing (the lazy self-heal) keep their behaviour.
+  const persistedStore = new Map<string, { instanceId: string; serverPort: number }>(
+    Object.entries(persisted).map(([clientId, pod]) => [
+      PREVIEW_CLIENT_KEY_PREFIX + encodeURIComponent(clientId),
+      pod,
+    ]),
+  );
   const source = await readFile(
     resolve(process.cwd(), "static/__sw__.js"),
     "utf8",
@@ -61,15 +77,26 @@ async function loadServiceWorkerSandbox(): Promise<ServiceWorkerSandbox> {
     caches: {
       open: () =>
         Promise.resolve({
+          keys: () =>
+            Promise.resolve([...persistedStore.keys()].map((url) => ({ url }))),
+          match: (request: { url?: string } | string) => {
+            const url =
+              typeof request === "string" ? request : (request.url ?? "");
+            const pod = persistedStore.get(url);
+            return Promise.resolve(
+              pod ? new Response(JSON.stringify(pod)) : undefined,
+            );
+          },
           // Record which persisted keys the SW deletes so tests can assert the
           // proactive release-time cleanup ran, not just the lazy fetch path.
           delete: (request: { url?: string } | string) => {
-            cacheDeletes.push(
-              typeof request === "string" ? request : (request.url ?? ""),
-            );
-            return Promise.resolve(true);
+            const url =
+              typeof request === "string" ? request : (request.url ?? "");
+            cacheDeletes.push(url);
+            return Promise.resolve(persistedStore.delete(url));
           },
-          match: () => Promise.resolve(undefined),
+          // No-op: keeping the seeded set fixed preserves the match()-misses
+          // behaviour the lazy self-heal test depends on.
           put: () => Promise.resolve(undefined),
         }),
     },
@@ -460,10 +487,9 @@ describe("service worker isolation headers", () => {
   });
 
   // Mutation captured: without proactive teardown cleanup, releasing an instance
-  // leaves its preview-client routes in the in-memory map and the persisted
-  // cache. A reopened project then inherits the stale dead-pod route and wedges
-  // (surfaced as "exited 137"). Release must forget the instance's routes eagerly.
-  it("forgets a released instance's preview-client routes at teardown", async () => {
+  // leaves its preview-client route in the in-memory map, so a later fetch keeps
+  // routing at the torn-down pod instead of falling through.
+  it("forgets a released instance's in-memory preview-client route", async () => {
     const sandbox = await loadServiceWorkerSandbox();
     const messageHandler = sandbox.__listeners?.message?.[0];
     const fetchHandler = sandbox.__listeners?.fetch?.[0];
@@ -497,16 +523,8 @@ describe("service worker isolation headers", () => {
     port.onmessage?.({
       data: { data: { instanceId: "pod" }, type: "release-instance" },
     });
-    // The persisted forget is a cache microtask; let it settle.
-    await new Promise((resolveTick) => setTimeout(resolveTick, 0));
 
-    // The persisted preview-client entry must be dropped eagerly at release,
-    // not left for a later fetch to lazily reap.
-    expect(sandbox.__cacheDeletes).toContain(
-      "https://nodepod.sw/preview-client/live-client",
-    );
-
-    // And a fetch on the released client now falls through instead of proxying.
+    // A fetch on the released client now falls through instead of proxying.
     let responsePromise: Promise<Response> | undefined;
     fetchHandler({
       clientId: "live-client",
@@ -526,5 +544,49 @@ describe("service worker isolation headers", () => {
 
     expect(sandbox.__fellThrough).toContain("http://localhost:5173/style.css");
     expect(await response.text()).toBe("network");
+  });
+
+  // Mutation captured: the browser recycles idle workers, so the in-memory maps
+  // start empty on reopen while the persisted mirror still holds the dead-pod
+  // route. If release only swept the in-memory map (or skipped cleanup when the
+  // recycled worker no longer had the instance claimed), the persisted route
+  // would survive and wedge the reopened project ("exited 137"). Release must
+  // sweep the Cache API by instanceId, unconditionally, and touch nothing else.
+  it("sweeps a released instance's persisted route after a worker restart", async () => {
+    const sandbox = await loadServiceWorkerSandbox({
+      "dead-client": { instanceId: "dead-pod", serverPort: 3000 },
+      "live-client": { instanceId: "live-pod", serverPort: 4000 },
+    });
+    const messageHandler = sandbox.__listeners?.message?.[0];
+    if (!messageHandler) throw new Error("message handler was not loaded");
+
+    // Freshly restarted worker: a port exists but nothing was re-claimed yet, so
+    // instancePorts is empty and the ownership check inside releaseInstance fails.
+    const port: {
+      onmessage: ((event: { data: unknown }) => void) | null;
+      postMessage: () => void;
+    } = { onmessage: null, postMessage: () => {} };
+    messageHandler({
+      data: { port, token: "token", type: "init" },
+      waitUntil: () => {},
+    });
+
+    port.onmessage?.({
+      data: { data: { instanceId: "dead-pod" }, type: "release-instance" },
+    });
+    // The persisted sweep is a multi-await cache chain (keys -> match -> json ->
+    // delete); flush several macrotask rounds so it fully settles.
+    for (let i = 0; i < 5; i += 1) {
+      await new Promise((resolveTick) => setTimeout(resolveTick, 0));
+    }
+
+    // Only the released instance's persisted route is dropped; the other pod's
+    // route is untouched.
+    expect(sandbox.__cacheDeletes).toContain(
+      "https://nodepod.sw/preview-client/dead-client",
+    );
+    expect(sandbox.__cacheDeletes).not.toContain(
+      "https://nodepod.sw/preview-client/live-client",
+    );
   });
 });
