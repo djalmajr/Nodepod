@@ -15,6 +15,7 @@ type ServiceWorkerListener = (event: {
 }) => void;
 
 interface ServiceWorkerSandbox extends Record<string, unknown> {
+  __fellThrough?: string[];
   __listeners?: Record<string, ServiceWorkerListener[]>;
   addPodIsolationHeaders?: (
     headers: Headers | Record<string, string>,
@@ -32,11 +33,13 @@ interface ServiceWorkerSandbox extends Record<string, unknown> {
 
 async function loadServiceWorkerSandbox(): Promise<ServiceWorkerSandbox> {
   const listeners: Record<string, ServiceWorkerListener[]> = {};
+  const fellThrough: string[] = [];
   const source = await readFile(
     resolve(process.cwd(), "static/__sw__.js"),
     "utf8",
   );
   const sandbox: ServiceWorkerSandbox = {
+    __fellThrough: fellThrough,
     __listeners: listeners,
     Headers,
     Request,
@@ -45,6 +48,13 @@ async function loadServiceWorkerSandbox(): Promise<ServiceWorkerSandbox> {
     TextEncoder,
     URL,
     atob,
+    // Requests the SW passes to the network (fall-through) instead of proxying
+    // to a pod. Lets tests assert self-healing dropped a dead route.
+    fetch: (request: { url?: string } | string) => {
+      const requestUrl = typeof request === "string" ? request : (request.url ?? "");
+      fellThrough.push(requestUrl);
+      return Promise.resolve(new Response("network", { status: 200 }));
+    },
     caches: {
       open: () =>
         Promise.resolve({
@@ -393,5 +403,49 @@ describe("service worker isolation headers", () => {
     expect(requests[2].url).toBe("/style.css");
     expect(cssResponse.status).toBe(200);
     expect(await cssResponse.text()).toBe("body{}");
+  });
+
+  // Mutation captured: without the dead-instance self-heal, a preview client
+  // that outlived its pod (project reopen, preview restart) keeps routing to
+  // the torn-down instance, wedging the preview instead of falling through.
+  it("drops a preview client whose instance is no longer registered", async () => {
+    const sandbox = await loadServiceWorkerSandbox();
+    const messageHandler = sandbox.__listeners?.message?.[0];
+    const fetchHandler = sandbox.__listeners?.fetch?.[0];
+    if (!messageHandler) throw new Error("message handler was not loaded");
+    if (!fetchHandler) throw new Error("fetch handler was not loaded");
+
+    // Register a preview client pointing at an instance that was never claimed
+    // (i.e. a torn-down pod): it is in previewClients but not in instancePorts.
+    messageHandler({
+      data: {
+        clientId: "stale-client",
+        instanceId: "dead-pod",
+        serverPort: 3000,
+        type: "register-preview",
+      },
+    });
+
+    let responsePromise: Promise<Response> | undefined;
+    fetchHandler({
+      clientId: "stale-client",
+      request: {
+        headers: new Headers(),
+        method: "GET",
+        mode: "no-cors",
+        referrer: "",
+        url: "http://localhost:5173/style.css",
+      } as unknown as Request,
+      respondWith: (response) => {
+        responsePromise = Promise.resolve(response);
+      },
+    });
+
+    if (!responsePromise) throw new Error("fetch listener did not call respondWith");
+    const response = await responsePromise;
+
+    // It must fall through to the network, not proxy to the dead pod.
+    expect(sandbox.__fellThrough).toContain("http://localhost:5173/style.css");
+    expect(await response.text()).toBe("network");
   });
 });

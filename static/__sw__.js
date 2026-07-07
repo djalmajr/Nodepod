@@ -571,18 +571,28 @@ self.addEventListener("fetch", (event) => {
     const host = url.hostname;
     if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === self.location.hostname) {
       const { instanceId, serverPort } = previewClients.get(routingClientId);
-      // strip /__preview__/{instanceId}/{port} or /__virtual__/{instanceId}/{port}
-      // (or legacy forms) if the browser resolved a relative URL against the
-      // preview page's location.
-      let path = stripPreviewPrefix(url.pathname);
-      path += url.search;
-      if (event.resultingClientId && event.resultingClientId !== routingClientId) {
-        trackPreviewClient(event.resultingClientId, { instanceId, serverPort });
+      // Self-heal: a preview client can outlive its pod (project reopen, preview
+      // restart) while still mapped to the torn-down instance. Routing to that
+      // dead instance wedges the preview, so drop the stale mapping and fall
+      // through to fresh routing (referer/path claims re-track the current pod).
+      // Skipped when the instance is still registered.
+      if (!instancePorts.has(instanceId)) {
+        previewClients.delete(routingClientId);
+        forgetPreviewClient(routingClientId);
+      } else {
+        // strip /__preview__/{instanceId}/{port} or /__virtual__/{instanceId}/{port}
+        // (or legacy forms) if the browser resolved a relative URL against the
+        // preview page's location.
+        let path = stripPreviewPrefix(url.pathname);
+        path += url.search;
+        if (event.resultingClientId && event.resultingClientId !== routingClientId) {
+          trackPreviewClient(event.resultingClientId, { instanceId, serverPort });
+        }
+        event.respondWith(
+          proxyToVirtualServer(event.request, instanceId, serverPort, path, event.request),
+        );
+        return;
       }
-      event.respondWith(
-        proxyToVirtualServer(event.request, instanceId, serverPort, path, event.request),
-      );
-      return;
     }
   }
 
