@@ -147,36 +147,58 @@ function claimInstance(mp, instanceId) {
   ports.get(mp).instances.add(instanceId);
 }
 
+// Sweep the persisted preview-client mirror for a released instance. The
+// in-memory maps below are wiped whenever the browser recycles an idle worker,
+// but the Cache API copy survives — so a reopened project would otherwise
+// inherit the stale dead-pod route from the cache alone. Enumerate by
+// instanceId (the key is the clientId, the instanceId lives in the value) so
+// the sweep works even with an empty in-memory map. Fire-and-forget.
+function forgetPersistedInstanceRoutes(instanceId) {
+  caches
+    .open(SW_STATE_CACHE)
+    .then(async (cache) => {
+      const keys = await cache.keys();
+      for (const req of keys) {
+        if (!req.url.startsWith(PREVIEW_CLIENT_KEY_PREFIX)) continue;
+        const stored = await cache.match(req);
+        if (!stored) continue;
+        const pod = await stored.json().catch(() => null);
+        if (pod && pod.instanceId === instanceId) await cache.delete(req);
+      }
+    })
+    .catch(() => {});
+}
+
 // Drop every routing reference to an instance that is being released: the
 // preview-client map (in-memory + persisted cache) and the path-claim map.
 // releaseInstance/cleanupPort already forget instancePorts/scripts/tokens but
-// left these two dangling, so a torn-down pod's routes survived teardown. On
+// left these dangling, so a torn-down pod's routes survived teardown. On
 // project reopen a boot-time fetch could then route at the dead instance and
 // wedge the preview (surfaced as "exited 137"). Clearing them here — instead of
 // lazily on the next fetch miss — keeps the persisted state from accumulating
 // stale dead-pod routes across sessions.
 function forgetInstanceRoutes(instanceId) {
   for (const [clientId, pod] of previewClients) {
-    if (pod && pod.instanceId === instanceId) {
-      previewClients.delete(clientId);
-      forgetPreviewClient(clientId);
-    }
+    if (pod && pod.instanceId === instanceId) previewClients.delete(clientId);
   }
   for (const [path, pod] of pathToPodMap) {
-    if (pod && pod.instanceId === instanceId) {
-      pathToPodMap.delete(path);
-    }
+    if (pod && pod.instanceId === instanceId) pathToPodMap.delete(path);
   }
+  forgetPersistedInstanceRoutes(instanceId);
 }
 
-// only release if this port still owns it. a newer tab may have reclaimed it
+// only release the in-memory port claim if this port still owns it (a newer tab
+// may have reclaimed it). instanceIds are unique per pod boot, so an explicit
+// release means this id is gone for good — forget its routes unconditionally,
+// even when a recycled worker no longer has it in instancePorts (the ownership
+// check would skip the whole cleanup otherwise and strand the persisted route).
 function releaseInstance(mp, instanceId) {
   if (instancePorts.get(instanceId) === mp) {
     instancePorts.delete(instanceId);
     previewScripts.delete(instanceId);
     wsTokens.delete(instanceId);
-    forgetInstanceRoutes(instanceId);
   }
+  forgetInstanceRoutes(instanceId);
   const info = ports.get(mp);
   if (info) info.instances.delete(instanceId);
 }
