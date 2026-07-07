@@ -10,6 +10,7 @@ import type {
 import { makeSystemError } from "../memory-volume";
 import { bytesToBase64, bytesToHex } from "../helpers/byte-encoding";
 import { precompileWasm } from "../helpers/wasm-cache";
+import { prefetchWasmFromCdn } from "../helpers/wasm-cdn";
 import { Readable, Writable } from "./stream";
 import { Buffer } from "./buffer";
 import type { FsReadStreamInstance, FsWriteStreamInstance, FsReadableState, FsWritableState } from "../types/fs-streams";
@@ -535,6 +536,21 @@ export function buildFileSystemBridge(
   // each bridge gets its own FD namespace (per-process isolation)
   const openFiles = new Map<number, OpenFile>();
   let fdCounter = 3;
+
+  function numericFlagsToString(f: number): string {
+    const O_WRONLY = 1;
+    const O_RDWR = 2;
+    const O_CREAT = 64;
+    const O_TRUNC = 512;
+    const O_APPEND = 1024;
+    const readWrite = (f & O_RDWR) === O_RDWR;
+    const writeOnly = (f & O_WRONLY) === O_WRONLY;
+    const append = (f & O_APPEND) === O_APPEND;
+    if (append) return readWrite ? "a+" : "a";
+    if (writeOnly) return "w";
+    if (readWrite) return (f & O_CREAT) || (f & O_TRUNC) ? "w+" : "r+";
+    return "r";
+  }
   const abs = (target: unknown) => resolvePath(target, getCwd);
 
   const fsConst: FsConstantsShape = {
@@ -1361,45 +1377,18 @@ export function buildFileSystemBridge(
         if (p.endsWith(".wasm")) precompileWasm(raw);
         return wrapAsBuffer(raw);
       } catch (err: any) {
-        // fall back to CDN for .wasm in node_modules that failed to extract (e.g. >15MB), script engine handles >4MB async compile
+        // .wasm under node_modules missing from the VFS (e.g. >15MB binary
+        // that skipped extraction): kick an async CDN prefetch so a retry
+        // succeeds, but never block this thread with a sync download.
         if (
           err?.code === "ENOENT" &&
           p.endsWith(".wasm") &&
-          p.includes("/node_modules/") &&
-          typeof XMLHttpRequest !== "undefined"
+          p.includes("/node_modules/")
         ) {
-          const nmIdx = p.lastIndexOf("/node_modules/");
-          const afterNm = p.substring(nmIdx + "/node_modules/".length);
-          const parts = afterNm.split("/");
-          let pkgName: string;
-          let filePath: string;
-          if (parts[0].startsWith("@")) {
-            pkgName = parts[0] + "/" + parts[1];
-            filePath = parts.slice(2).join("/");
-          } else {
-            pkgName = parts[0];
-            filePath = parts.slice(1).join("/");
-          }
-          let version = "latest";
-          try {
-            const pkgJsonPath = p.substring(0, nmIdx + "/node_modules/".length) + pkgName + "/package.json";
-            const pkgJson = JSON.parse(volume.readFileSync(pkgJsonPath, "utf8"));
-            if (pkgJson.version) version = pkgJson.version;
-          } catch { /* use latest */ }
-          const cdnUrl = `https://cdn.jsdelivr.net/npm/${pkgName}@${version}/${filePath}`;
-          try {
-            const xhr = new XMLHttpRequest();
-            xhr.open("GET", cdnUrl, false); // synchronous
-            xhr.responseType = "arraybuffer";
-            xhr.send();
-            if (xhr.status === 200 && xhr.response) {
-              const bytes = new Uint8Array(xhr.response as ArrayBuffer);
-              // cache in VFS so subsequent reads hit it
-              volume.writeFileSync(p, bytes);
-              precompileWasm(bytes);
-              return wrapAsBuffer(bytes);
-            }
-          } catch { /* CDN fallback failed, rethrow original */ }
+          console.warn(
+            `[nodepod] ${p} not in VFS — fetching from CDN in the background; the next read will succeed once it lands`,
+          );
+          prefetchWasmFromCdn(volume, p).catch(() => {});
         }
         throw err;
       }
@@ -1565,7 +1554,7 @@ export function buildFileSystemBridge(
     },
     openSync(target: unknown, flags: string | number, _mode?: number): number {
       const p = abs(target);
-      const flagStr = typeof flags === "number" ? "r" : flags;
+      const flagStr = typeof flags === "number" ? numericFlagsToString(flags) : flags;
       const exists = volume.existsSync(p);
       const isWrite = flagStr.includes("w") || flagStr.includes("a");
       const isReadOnly = flagStr.includes("r") && !flagStr.includes("+");

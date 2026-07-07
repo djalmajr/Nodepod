@@ -8,6 +8,19 @@ import { offload, taskId, TaskPriority } from "../threading/offload";
 import type { ExtractResult } from "../threading/offload-types";
 import { base64ToBytes } from "../helpers/byte-encoding";
 import { precompileWasm } from "../helpers/wasm-cache";
+import { getTarballCache } from "../persistence/tarball-cache";
+
+// skip round-tripping very large tarballs back from the worker just to cache
+const TARBALL_CACHE_MAX_BYTES = 20 * 1024 * 1024;
+
+/** Returns safe absolute path if relative stays inside destDir, else null (zip-slip guard). */
+export function safeJoin(destDir: string, relative: string): string | null {
+  const base = path.normalize(destDir).replace(/\/+$/, "");
+  const abs = path.normalize(path.join(base, relative));
+  if (abs === base) return abs;
+  if (abs.startsWith(base + "/")) return abs;
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -160,7 +173,8 @@ export function extractArchive(
 
     if (filter && !filter(relative)) continue;
 
-    const absolute = path.join(destDir, relative);
+    const absolute = safeJoin(destDir, relative);
+    if (!absolute) continue;
 
     if (entry.kind === "directory") {
       vol.mkdirSync(absolute, { recursive: true });
@@ -193,6 +207,18 @@ export async function downloadAndExtract(
 ): Promise<string[]> {
   opts.onProgress?.(`Fetching ${url}...`);
 
+  // warm runs skip the network: pass cached tarball bytes into the worker;
+  // on a miss ask the worker for the compressed bytes and persist them.
+  // any cache failure degrades to an uncached install.
+  let cachedBytes: ArrayBuffer | null = null;
+  let cache: Awaited<ReturnType<typeof getTarballCache>> = null;
+  try {
+    cache = await getTarballCache();
+    if (cache) cachedBytes = await cache.get(url);
+  } catch {
+    cache = null;
+  }
+
   const result: ExtractResult = await offload({
     type: "extract",
     id: taskId(),
@@ -200,13 +226,26 @@ export async function downloadAndExtract(
     stripComponents: opts.stripComponents ?? 1,
     priority: TaskPriority.NORMAL,
     expectedShasum: opts.expectedShasum,
+    tarballBytes: cachedBytes ?? undefined,
+    wantTarball: !cachedBytes && !!cache,
   });
+
+  if (
+    cache &&
+    !cachedBytes &&
+    result.tarballBytes &&
+    result.tarballBytes.byteLength > 0 &&
+    result.tarballBytes.byteLength <= TARBALL_CACHE_MAX_BYTES
+  ) {
+    cache.put(url, result.tarballBytes, opts.expectedShasum).catch(() => {});
+  }
 
   const writtenPaths: string[] = [];
   for (const file of result.files) {
     if (opts.filter && !opts.filter(file.path)) continue;
 
-    const absolute = path.join(destDir, file.path);
+    const absolute = safeJoin(destDir, file.path);
+    if (!absolute) continue;
     const parentDir = path.dirname(absolute);
     vol.mkdirSync(parentDir, { recursive: true });
 
@@ -240,6 +279,15 @@ export async function downloadAndExtractDirect(
 ): Promise<string[]> {
   opts.onProgress?.(`Fetching ${url}...`);
 
+  let cache: Awaited<ReturnType<typeof getTarballCache>> = null;
+  try {
+    cache = await getTarballCache();
+    const cached = cache ? await cache.get(url) : null;
+    if (cached) return extractArchive(cached, vol, destDir, opts);
+  } catch {
+    cache = null;
+  }
+
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(
@@ -248,6 +296,9 @@ export async function downloadAndExtractDirect(
   }
 
   const rawBytes = await response.arrayBuffer();
+  if (cache && rawBytes.byteLength > 0 && rawBytes.byteLength <= TARBALL_CACHE_MAX_BYTES) {
+    cache.put(url, rawBytes, opts.expectedShasum).catch(() => {});
+  }
   return extractArchive(rawBytes, vol, destDir, opts);
 }
 
